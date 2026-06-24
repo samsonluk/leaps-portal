@@ -1,6 +1,4 @@
 streamlit
-openai
-anthropic
-yfinance>=0.2.61
 pandas
+requests
 google-generativeai
