@@ -110,7 +110,8 @@ if ticker_input:
                 """
                 
                 # Call Gemini Flash model for completely free reasoning execution
-                model = genai.GenerativeModel("gemini-1.5-flash")
+                # NEW UPDATED LINE
+                model = genai.GenerativeModel("gemini-2.5-flash")
                 response = model.generate_content(ai_prompt)
                 
                 st.markdown("---")
