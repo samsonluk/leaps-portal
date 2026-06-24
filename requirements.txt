@@ -1,3 +1,6 @@
 streamlit
 openai
 anthropic
+yfinance
+pandas
+google-generativeai
