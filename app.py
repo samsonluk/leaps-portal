@@ -1,101 +1,143 @@
-import os
-import sys
-from typing import Optional
+import streamlit as st
+import requests
 import pandas as pd
+from datetime import datetime, timedelta
+import google.generativeai as genai
 
-try:
-    from marketdata import MarketDataClient, OutputFormat
-except ImportError:
-    print("Error: The 'marketdata' SDK is not installed.")
-    print("Please install it via pip: pip install marketdata-app-sdk")
-    sys.exit(1)
+# 1. Page Configuration
+st.set_page_config(page_title="Market Data DITM LEAPS Portal", page_icon="📈", layout="wide")
 
+# 2. Secure API Configurations from Streamlit Secrets
+if "GEMINI_FREE_KEY" in st.secrets and "MARKETDATA_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_FREE_KEY"])
+    MD_KEY = st.secrets["MARKETDATA_API_KEY"]
+else:
+    st.error("Missing API Keys (MARKETDATA_API_KEY or GEMINI_FREE_KEY) in Streamlit Secrets!")
+    st.stop()
 
-def fetch_options_chain(
-    symbol: str, 
-    side: Optional[str] = None, 
-    strike_range: Optional[str] = None
-) -> Optional[pd.DataFrame]:
-    """
-    Fetches the current options chain for a given underlying ticker symbol.
-    
-    Parameters:
-        symbol (str): The underlying stock ticker (e.g., 'AAPL').
-        side (str, optional): Filter by 'call' or 'put'. Defaults to None (both).
-        strike_range (str, optional): Filter by moneyness ('itm', 'otm', 'atm'). 
-                                      Defaults to None (all).
-                                      
-    Returns:
-        pd.DataFrame: A pandas DataFrame containing the option chain data,
-                      or None if an error occurs.
-    """
-    # 1. Check for API Token
-    # The SDK automatically checks MARKETDATA_TOKEN, but explicit validation
-    # provides a much cleaner, human-readable error message.
-    token = os.environ.get("MARKETDATA_TOKEN")
-    if not token:
-        print("[-] Error: MARKETDATA_TOKEN environment variable is not set.")
-        print("    Please set it in your environment before running this script.")
-        print("    Linux/macOS: export MARKETDATA_TOKEN='your_api_key'")
-        print("    Windows (CMD): set MARKETDATA_TOKEN=your_api_key")
-        print("    Windows (PowerShell): $env:MARKETDATA_TOKEN='your_api_key'")
-        return None
+st.title("📈 Free Tier Deep In-The-Money (DITM) LEAPS Portal")
+st.subheader("Powered by MarketData App (Free Options API) & Gemini")
 
-    print(f"[+] Initializing Market Data Client...")
-    client = MarketDataClient(token=token)
+# Calculate 1 to 1.5 year target window automatically
+current_date = datetime.now()
+target_start = current_date + timedelta(days=365)  
+target_end = current_date + timedelta(days=545)    
 
-    # Configure parameters dynamically based on arguments passed
-    kwargs = {
-        "symbol": symbol.upper(),
-        "output_format": OutputFormat.DATAFRAME
-    }
-    
-    if side:
-        kwargs["side"] = side.lower()
-    if strike_range:
-        kwargs["range"] = strike_range.lower()
+st.info(f"📅 **Automated Window Tracking:** Target window between **{target_start.strftime('%B %Y')}** and **{target_end.strftime('%B %Y')}**.")
 
-    print(f"[+] Requesting option chain for {kwargs['symbol']}...")
-    try:
-        # 2. Fetch data via the Python SDK
-        chain_df = client.options.chain(**kwargs)
-        
-        # 3. Validate response
-        if chain_df is None or chain_df.empty:
-            print(f"[-] No options data returned for {symbol}. Check the ticker symbol or filters.")
-            return None
+# 3. User Input
+ticker_input = st.text_input("Enter Stock Ticker Symbol:", placeholder="e.g., AAPL, NVDA, MSFT").strip().upper()
+
+if ticker_input:
+    with st.spinner(f"Fetching option chains from MarketData for {ticker_input}..."):
+        try:
+            # --- PHASE 1: FETCH CURRENT UNDERLYING PRICE ---
+            price_url = f"https://api.marketdata.app/v1/stocks/quotes/{ticker_input}/?token={MD_KEY}"
+            price_res = requests.get(price_url).json()
             
-        print(f"[+] Successfully retrieved {len(chain_df)} option contracts.")
-        return chain_df
-
-    except Exception as e:
-        print(f"[-] An unexpected error occurred while fetching the data: {e}")
-        return None
-
-
-if __name__ == "__main__":
-    # --- Configuration ---
-    TARGET_TICKER = "AAPL"
-    OPTION_SIDE = None          # Options: 'call', 'put', or None for both
-    MONEYNESS_RANGE = "itm"     # Options: 'itm' (In the Money), 'otm', 'all', or None
-    
-    # --- Execution ---
-    df = fetch_options_chain(
-        symbol=TARGET_TICKER, 
-        side=OPTION_SIDE, 
-        strike_range=MONEYNESS_RANGE
-    )
-    
-    # --- Output & Display ---
-    if df is not None:
-        print("\n=== Data Preview (First 10 Rows) ===")
-        # Adjust pandas settings to prevent truncation in terminal output
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', 1000)
-        
-        print(df.head(10))
-        
-        # Optional: Save results to a CSV file
-        output_filename = f"{TARGET_TICKER.lower()}_options_chain.csv"
-        df.to_csv(output_filename)
-        print(f"\n[+] Full dataset exported safely to: {output_filename}")
+            if "last" not in price_res or not price_res["last"]:
+                st.error(f"Could not retrieve a valid stock quote for ticker: {ticker_input}. Verify symbol or API limit.")
+                st.stop()
+                
+            current_price = float(price_res["last"][0])
+            
+            # --- PHASE 2: FETCH OPTIONS CHAIN ---
+            chain_url = f"https://api.marketdata.app/v1/options/chain/{ticker_input}/?expiration=all&side=call&token={MD_KEY}"
+            chain_res = requests.get(chain_url).json()
+            
+            if "status" in chain_res and chain_res["status"] == "ERROR":
+                st.error(f"API Error: {chain_res.get('message', 'Failed to retrieve options data')}")
+                st.stop()
+                
+            if "underlying" not in chain_res and "updated" not in chain_res:
+                st.error(f"No option chain data returned for {ticker_input}. You may have exhausted your 100 daily credits.")
+                st.stop()
+                
+            # --- PHASE 3: PARSE AND FILTER FOR DITM LEAPS ---
+            # Rebuilding flat parallel arrays to prevent 'final_df not defined' error
+            raw_df = pd.DataFrame({
+                "Side": chain_res.get("side", []),
+                "Expiration": chain_res.get("expiration", []),
+                "Strike": [float(s) for s in chain_res.get("strike", [])],
+                "Bid": [float(b) for b in chain_res.get("bid", [])],
+                "Ask": [float(a) for a in chain_res.get("ask", [])],
+                "OI": [int(o) for o in chain_res.get("openInterest", [])]
+            })
+            
+            # Step 1: Force filter out everything except Calls
+            raw_df = raw_df[raw_df["Side"] == "call"].copy()
+            
+            # Step 2: Safely parse text timestamps to dates
+            raw_df["Exp_Date"] = pd.to_datetime(raw_df["Expiration"], errors="coerce")
+            
+            # Step 3: Run the 1 to 1.5 year target date filtering window
+            leaps_df = raw_df[(raw_df["Exp_Date"] >= pd.to_datetime(target_start)) & 
+                               (raw_df["Exp_Date"] <= pd.to_datetime(target_end))].copy()
+            
+            # Fallback Rail: If the free tier cuts far forward options short, grab furthest available
+            if leaps_df.empty and not raw_df.empty:
+                max_date = raw_df["Exp_Date"].max()
+                leaps_df = raw_df[raw_df["Exp_Date"] == max_date].copy()
+            
+            if leaps_df.empty:
+                st.error("No valid options contracts whatsoever were found for this asset.")
+                st.stop()
+                
+            # Isolate the targeted expiration date layer
+            target_expiry = leaps_df["Expiration"].min()
+            final_df = leaps_df[leaps_df["Expiration"] == target_expiry].copy()
+            
+            # Step 4: Filter for Deep In-The-Money (Strikes less than current stock price)
+            final_df = final_df[final_df["Strike"] < current_price].copy()
+            
+            if final_df.empty:
+                st.error("No Deep In-The-Money options matched your filtration thresholds (Strikes are all above current price).")
+                st.stop()
+                
+            # --- PHASE 4: STRUCTURAL METRICS & MATH ---
+            final_df["Mid Premium"] = (final_df["Bid"] + final_df["Ask"]) / 2
+            final_df["Intrinsic"] = current_price - final_df["Strike"]
+            final_df["Extrinsic"] = (final_df["Mid Premium"] - final_df["Intrinsic"]).clip(lower=0)
+            final_df["Extrinsic Drag %"] = ((final_df["Extrinsic"] / current_price) * 100).round(2)
+            final_df["Break Even"] = final_df["Strike"] + final_df["Mid Premium"]
+            final_df["B/E % Move"] = (((final_df["Break Even"] - current_price) / current_price) * 100).round(2)
+            
+            # Keep and format output presentation columns
+            output_df = final_df[["Strike", "Mid Premium", "OI", "Extrinsic Drag %", "B/E % Move"]].copy()
+            output_df = output_df.rename(columns={"OI": "Open Interest (OI)"})
+            
+            # Sort strikes from deep cushion to higher bounds, trim snapshot matrix for display
+            output_df = output_df.sort_values(by="Strike", ascending=False).tail(8)
+            data_payload = output_df.to_string(index=False)
+            
+            # --- PHASE 5: DISPLAY & AI ASSESSMENT ---
+            st.success(f"### Live Market Sync: {ticker_input} is trading at ${current_price:.2f}")
+            st.info(f"📦 Selected Expiration: **{target_expiry}**")
+            
+            st.markdown("#### 📊 Official Options Chain Metrics (MarketData Feed)")
+            st.dataframe(output_df, use_container_width=True, hide_index=True)
+            
+            with st.spinner("Invoking free AI layer to verify risk-reward anomalies..."):
+                ai_prompt = f"""
+                You are an options trading specialist. Analyze this DITM LEAPS Call data for {ticker_input}.
+                Current Stock Price: ${current_price:.2f}
+                Expiration Date: {target_expiry}
+                
+                Data Matrix:
+                {data_payload}
+                
+                Please provide:
+                1. Identify which strike represents the 'Best Premium Value' (lowest structural extrinsic drag while keeping a deep strike cushion).
+                2. Identify which strike represents 'Maximum Leverage' (highest relative capital efficiency near the upper bounds of the data pool).
+                3. Examine the Open Interest (OI) column. Warn the user specifically about any strikes suffering from dangerously low order depth.
+                """
+                
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                response = model.generate_content(ai_prompt)
+                
+                st.markdown("---")
+                st.markdown("### 🤖 Automated AI Strategic Assessment")
+                st.markdown(response.text)
+                
+        except Exception as e:
+            st.error(f"Error executing portal automation sequence: {str(e)}")
