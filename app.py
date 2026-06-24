@@ -40,11 +40,17 @@ if ticker_input:
                 st.stop()
                 
             current_price = float(price_res["last"][0])
+
+            # --- PHASE 2: FETCH OPTIONS CHAIN (EXPLICIT FORWARD PARAMETERS) ---
+            # Using the 'expiration=all' query string tells the system to bypass 
+            # single-month limits and deliver the complete forward chain.
+            chain_url = f"https://api.marketdata.app/v1/options/chain/{ticker_input}/?expiration=all&side=call&token={MD_KEY}"
+            chain_res = requests.get(chain_url).json()
             
             # --- PHASE 2: FETCH OPTIONS CHAIN ---
             # MarketData allows filtering right in the URL to save bandwidth!
-            chain_url = f"https://api.marketdata.app/v1/options/chain/{ticker_input}/?token={MD_KEY}"
-            chain_res = requests.get(chain_url).json()
+            # chain_url = f"https://api.marketdata.app/v1/options/chain/{ticker_input}/?token={MD_KEY}"
+            # chain_res = requests.get(chain_url).json()
             
             if "status" in chain_res and chain_res["status"] == "ERROR":
                 st.error(f"API Error: {chain_res.get('message', 'Failed to retrieve options data')}")
