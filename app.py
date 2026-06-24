@@ -1,104 +1,129 @@
 import streamlit as st
-import yfinance as yf
+import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import google.generativeai as genai
 
 # 1. Page Configuration
-st.set_page_config(page_title="Free DITM LEAPS Portal", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Alpha Vantage DITM LEAPS Portal", page_icon="📈", layout="wide")
 
-# 2. Secure Free Backend Connection via Streamlit Secrets
-if "GEMINI_FREE_KEY" in st.secrets:
+# 2. Secure API Configurations
+if "GEMINI_FREE_KEY" in st.secrets and "ALPHA_VANTAGE_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_FREE_KEY"])
+    AV_KEY = st.secrets["ALPHA_VANTAGE_KEY"]
 else:
-    genai.configure(api_key="PASTE_YOUR_FREE_GEMINI_KEY_HERE_IF_TESTING_LOCAL")
+    st.error("Missing API Keys (ALPHA_VANTAGE_KEY or GEMINI_FREE_KEY) in Streamlit Secrets!")
+    st.stop()
 
-st.title("📈 Free Deep In-The-Money (DITM) LEAPS Portal")
-st.subheader("Automated live chain scraping & AI analysis with zero user keys required.")
+st.title("📈 Alpha Vantage Deep In-The-Money (DITM) LEAPS Portal")
+st.subheader("Official Alpha Vantage data feed with automated AI strategy mapping.")
 
-# Calculate 1 to 1.5 year target window automatically
+# Calculate 1 to 1.5 year target window automatically (targeting June 2026 anchor)
 current_date = datetime.now()
 target_start = current_date + timedelta(days=365)  
 target_end = current_date + timedelta(days=545)    
+
+st.info(f"📅 **Automated Window Tracking:** Target window between **{target_start.strftime('%B %Y')}** and **{target_end.strftime('%B %Y')}**.")
 
 # 3. User Input
 ticker_input = st.text_input("Enter Stock Ticker Symbol:", placeholder="e.g., AAPL, NVDA, MSFT").strip().upper()
 
 if ticker_input:
-    with st.spinner(f"Scraping live market options chains for {ticker_input}..."):
+    with st.spinner(f"Fetching option chains from Alpha Vantage for {ticker_input}..."):
         try:
-            # --- PHASE 1: FREE PYTHON LIVE DATA FETCHING ---
-            asset = yf.Ticker(ticker_input)
+            # --- PHASE 1: FETCH CURRENT REAL-TIME/DELAYED UNDERLYING PRICE ---
+            price_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker_input}&apikey={AV_KEY}"
+            price_res = requests.get(price_url).json()
             
-            # Fetch current price
-            price_history = asset.history(period="1d")
-            if price_history.empty:
-                st.error(f"Could not verify market pricing data for ticker: {ticker_input}")
+            if "Global Quote" not in price_res or not price_res["Global Quote"]:
+                st.error(f"Could not retrieve a valid stock quote for ticker: {ticker_input}. Verify symbol or API limits.")
                 st.stop()
-            current_price = round(price_history['Close'].iloc[-1], 2)
-            
-            # Filter for expiration dates 1 to 1.5 years away
-            all_expirations = asset.options
-            valid_expirations = []
-            
-            for exp in all_expirations:
-                exp_date = datetime.strptime(exp, "%Y-%m-%d")
-                if target_start <= exp_date <= target_end:
-                    valid_expirations.append(exp)
-            
-            if not valid_expirations:
-                valid_expirations = [all_expirations[-1]]
                 
-            selected_expiry = valid_expirations[0]
+            current_price = float(price_res["Global Quote"]["05. price"])
             
-            # Grab the Call options chain data frame
-            opt_chain = asset.option_chain(selected_expiry)
-            calls = opt_chain.calls
+            # --- PHASE 2: FETCH REAL-TIME OPTIONS CHAIN ---
+            options_url = f"https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={ticker_input}&apikey={AV_KEY}"
+            options_res = requests.get(options_url).json()
             
-            # Filter down to true deep ITM options (Strikes below current stock price)
-            itm_calls = calls[calls['strike'] < current_price].copy()
+            if "data" not in options_res or not options_res["data"]:
+                st.error(f"No option chain data returned for {ticker_input}. Alpha Vantage standard tier may be rate-limiting.")
+                st.stop()
+                
+            raw_options = options_res["data"]
             
-            # Perform mathematical structural mappings
-            itm_calls['midpoint'] = (itm_calls['bid'] + itm_calls['ask']) / 2
-            itm_calls['intrinsic'] = current_price - itm_calls['strike']
-            itm_calls['extrinsic'] = itm_calls['midpoint'] - itm_calls['intrinsic']
-            itm_calls['extrinsic_drag_pct'] = round((itm_calls['extrinsic'] / current_price) * 100, 2)
-            itm_calls['break_even'] = itm_calls['strike'] + itm_calls['midpoint']
-            itm_calls['break_even_pct_move'] = round(((itm_calls['break_even'] - current_price) / current_price) * 100, 2)
+            # --- PHASE 3: PARSE AND FILTER FOR DITM LEAPS ---
+            parsed_data = []
+            valid_expirations = set()
             
-            # Fill missing Open Interest numbers cleanly with 0
-            itm_calls['openInterest'] = itm_calls['openInterest'].fillna(0).astype(int)
+            for contract in raw_options:
+                # Isolate Calls only
+                if contract.get("type") != "call":
+                    continue
+                    
+                # Date validations
+                exp_str = contract.get("expiration")
+                if not exp_str:
+                    continue
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
+                
+                # Check if expiration lands inside our strict 1 to 1.5 year window
+                if target_start <= exp_date <= target_end:
+                    valid_expirations.add(exp_str)
+                    
+                    strike = float(contract.get("strike", 0))
+                    # Filter for Deep ITM (Strikes below current asset value)
+                    if strike < current_price:
+                        # Grab core pricing numbers
+                        bid = float(contract.get("bid", 0) or 0)
+                        ask = float(contract.get("ask", 0) or 0)
+                        oi = int(contract.get("open_interest", 0) or 0)
+                        
+                        midpoint = (bid + ask) / 2 if (bid + ask) > 0 else (current_price - strike) * 1.02
+                        intrinsic = current_price - strike
+                        extrinsic = max(0.0, midpoint - intrinsic)
+                        extrinsic_drag_pct = round((extrinsic / current_price) * 100, 2)
+                        break_even = strike + midpoint
+                        be_pct_move = round(((break_even - current_price) / current_price) * 100, 2)
+                        
+                        parsed_data.append({
+                            "Expiration": exp_str,
+                            "Strike": strike,
+                            "Mid Premium": round(midpoint, 2),
+                            "Open Interest (OI)": oi,
+                            "Extrinsic Drag %": extrinsic_drag_pct,
+                            "B/E % Move": be_pct_move
+                        })
             
-            # Grab relevant sample rows across the pricing spectrum to feed the AI (Now featuring openInterest)
-            display_df = itm_calls[['strike', 'midpoint', 'openInterest', 'impliedVolatility', 'extrinsic_drag_pct', 'break_even_pct_move']].tail(8)
+            if not parsed_data:
+                st.error("No valid DITM LEAPS contracts found matching the 1-1.5 year target window rules.")
+                st.stop()
+                
+            # Convert to Dataframe
+            all_options_df = pd.DataFrame(parsed_data)
             
-            # Rename columns for pristine table formatting
-            formatted_df = display_df.rename(columns={
-                'strike': 'Strike',
-                'midpoint': 'Mid Premium',
-                'openInterest': 'Open Interest (OI)',
-                'impliedVolatility': 'IV',
-                'extrinsic_drag_pct': 'Extrinsic Drag %',
-                'break_even_pct_move': 'B/E % Move'
-            })
+            # Group data to target the absolute nearest valid contract expiration month inside the window
+            target_expiry = sorted(list(valid_expirations))[0]
+            final_df = all_options_df[all_options_df["Expiration"] == target_expiry].copy()
             
-            # Convert raw dataframe to a string segment for the LLM context pass
-            data_payload = formatted_df.to_string(index=False)
+            # Sort by strike and trim to a clear snapshot block for presentation and context size limits
+            final_df = final_df.sort_values(by="Strike", ascending=False).tail(8)
             
-            # --- PHASE 2: FREE AI STRATEGY RENDERING ---
-            st.success(f"### Live Market Sync: {ticker_input} is trading at ${current_price}")
-            st.info(f"📦 Selected Expiration: **{selected_expiry}**")
+            # Drop the redundant date column from the preview matrix
+            preview_df = final_df.drop(columns=["Expiration"])
+            data_payload = preview_df.to_string(index=False)
             
-            # Show the raw math instantly to the user
-            st.markdown("#### 📊 Live Scraped Options Chain Metrics")
-            st.dataframe(formatted_df, use_container_width=True, hide_index=True)
+            # --- PHASE 4: RENDER & EXECUTE AI OVERLAY ---
+            st.success(f"### Live Market Sync: {ticker_input} is trading at ${current_price:.2f}")
+            st.info(f"📦 Selected Expiration: **{target_expiry}**")
             
-            with st.spinner("Invoking free AI layer to cross-reference Open Interest thresholds..."):
-                # Assemble context-specific prompt containing Open Interest figures
+            st.markdown("#### 📊 Official Options Chain Metrics (Alpha Vantage Feed)")
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            
+            with st.spinner("Invoking free AI layer to verify risk-reward anomalies..."):
                 ai_prompt = f"""
-                You are an options trading specialist. Analyze this scraped DITM LEAPS Call data for {ticker_input}.
-                Current Stock Price: ${current_price}
-                Expiration Date: {selected_expiry}
+                You are an options trading specialist. Analyze this DITM LEAPS Call data for {ticker_input}.
+                Current Stock Price: ${current_price:.2f}
+                Expiration Date: {target_expiry}
                 
                 Data Matrix:
                 {data_payload}
@@ -106,11 +131,9 @@ if ticker_input:
                 Please provide:
                 1. Identify which strike represents the 'Best Premium Value' (lowest structural extrinsic drag while keeping a deep strike cushion).
                 2. Identify which strike represents 'Maximum Leverage' (highest relative capital efficiency near the upper bounds of the data pool).
-                3. Examine the Open Interest (OI) column. Warn the user specifically about any strikes suffering from dangerously low order depth (e.g., OI under 100 contracts) which might result in predatory bid-ask spreads when trying to exit the trade.
+                3. Examine the Open Interest (OI) column. Warn the user specifically about any strikes suffering from dangerously low order depth.
                 """
                 
-                # Call Gemini Flash model for completely free reasoning execution
-                # NEW UPDATED LINE
                 model = genai.GenerativeModel("gemini-2.5-flash")
                 response = model.generate_content(ai_prompt)
                 
