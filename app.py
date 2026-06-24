@@ -31,15 +31,27 @@ ticker_input = st.text_input("Enter Stock Ticker Symbol:", placeholder="e.g., AA
 if ticker_input:
     with st.spinner(f"Fetching option chains from Alpha Vantage for {ticker_input}..."):
         try:
+            
             # --- PHASE 1: FETCH CURRENT REAL-TIME/DELAYED UNDERLYING PRICE ---
             price_url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker_input}&apikey={AV_KEY}"
             price_res = requests.get(price_url).json()
             
-            if "Global Quote" not in price_res or not price_res["Global Quote"]:
-                st.error(f"Could not retrieve a valid stock quote for ticker: {ticker_input}. Verify symbol or API limits.")
+            # --- DEBUG BLOCK FOR TROUBLESHOOTING ---
+            if "Note" in price_res:
+                st.error("🛑 **Alpha Vantage Rate Limit Reached:** You have exceeded the 25 requests/day or 5 requests/minute free tier limit. Please wait 60 seconds and try again.")
                 st.stop()
                 
-            current_price = float(price_res["Global Quote"]["05. price"])
+            if "ErrorMessage" in price_res:
+                st.error(f"❌ **Alpha Vantage API Key Issue:** The server rejected the key. Message: {price_res['ErrorMessage']}")
+                st.stop()
+            
+            if "Global Quote" not in price_res or not price_res["Global Quote"]:
+                st.error("⚠️ **Unexpected Structural Response from API.** Details below:")
+                st.json(price_res)  # This will print the exact raw error code to your Streamlit screen
+                st.stop()
+            # ----------------------------------------
+                
+            current_price = float(price_res["Global Quote"]["05. price"])        
             
             # --- PHASE 2: FETCH REAL-TIME OPTIONS CHAIN ---
             options_url = f"https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={ticker_input}&apikey={AV_KEY}"
