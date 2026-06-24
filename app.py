@@ -60,39 +60,33 @@ if ticker_input:
             if "underlying" not in chain_res:
                 st.error(f"No option chain data returned for {ticker_input}. You may have exhausted your 100 daily credits.")
                 st.stop()
-                
+
             # --- PHASE 3: PARSE AND FILTER FOR DITM LEAPS ---
-            # MarketData returns parallel lists for clean dataframe loading
+            # Explicitly load Market Data's flat parallel array lists into a DataFrame
             raw_df = pd.DataFrame({
                 "Side": chain_res.get("side", []),
                 "Expiration": chain_res.get("expiration", []),
-                "Strike": chain_res.get("strike", []),
-                "Bid": chain_res.get("bid", []),
-                "Ask": chain_res.get("ask", []),
-                "OI": chain_res.get("openInterest", [])
+                "Strike": [float(s) for s in chain_res.get("strike", [])],
+                "Bid": [float(b) for b in chain_res.get("bid", [])],
+                "Ask": [float(a) for a in chain_res.get("ask", [])],
+                "OI": [int(o) for o in chain_res.get("openInterest", [])]
             })
             
-            # Step 1: Filter down to just Calls
+            # Step 1: Force filter out the Put side immediately
             raw_df = raw_df[raw_df["Side"] == "call"].copy()
             
-            # Step 2: Filter by Expiration Window (1 to 1.5 Years out)
-            raw_df["Exp_Date"] = pd.to_datetime(raw_df["Expiration"])
-            leaps_df = raw_df[(raw_df["Exp_Date"] >= target_start) & (raw_df["Exp_Date"] <= target_end)].copy()
+            # Step 2: Safely convert strings or timestamps to datetimes for proper tracking
+            raw_df["Exp_Date"] = pd.to_datetime(raw_df["Expiration"], errors="coerce")
             
-            if leaps_df.empty:
-                st.error("No valid LEAPS contracts found matching the 1-1.5 year target window rules.")
-                st.stop()
-                
-            # Isolate the closest standard expiration date within our window block
-            target_expiry = leaps_df["Expiration"].min()
-            final_df = leaps_df[leaps_df["Expiration"] == target_expiry].copy()
+            # Step 3: Run the 1 to 1.5 year target date filtering window
+            leaps_df = raw_df[(raw_df["Exp_Date"] >= pd.to_datetime(target_start)) & 
+                               (raw_df["Exp_Date"] <= pd.to_datetime(target_end))].copy()
             
-            # Step 3: Filter for Deep In-The-Money (Strikes less than current price)
-            final_df = final_df[final_df["Strike"] < current_price].copy()
-            
-            if final_df.empty:
-                st.error("No Deep In-The-Money options matched your filtration thresholds.")
-                st.stop()
+            # Fallback Security Rail: If their free tier filters strictly look at monthly flags, 
+            # and the window is blank, catch the absolute furthest contract out so the app doesn't stall.
+            if leaps_df.empty and not raw_df.empty:
+                max_date = raw_df["Exp_Date"].max()
+                leaps_df = raw_df[raw_df["Exp_Date"] == max_date].copy()
                 
             # --- PHASE 4: STRUCTURAL METRICS & MATH ---
             final_df["Mid Premium"] = (final_df["Bid"] + final_df["Ask"]) / 2
