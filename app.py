@@ -35,9 +35,20 @@ if ticker_input:
             price_url = f"https://api.marketdata.app/v1/stocks/quotes/{ticker_input}/?token={MD_KEY}"
             price_res = requests.get(price_url).json()
             
-            if "last" not in price_res or not price_res["last"]:
-                st.error(f"Could not retrieve a valid stock quote for ticker: {ticker_input}. Verify symbol or API limit.")
+            # --- INSTANT DEBUG PROTECTION ---
+            if "status" in price_res and price_res["status"] == "ERROR":
+                st.error(f"🛑 **MarketData API Error:** {price_res.get('message', 'Unknown Error')}")
                 st.stop()
+                
+            if "s" in price_res and price_res["s"] != "ok":
+                st.error(f"❌ **MarketData Server Notification:** {price_res.get('errmsg', 'No data available for this ticker.')}")
+                st.stop()
+                
+            if "last" not in price_res or not price_res["last"]:
+                st.error("⚠️ **Unexpected Response Grid Layout.** Raw server output displayed below:")
+                st.json(price_res)  # This forces your portal screen to show the exact error message
+                st.stop()
+            # ---------------------------------
                 
             current_price = float(price_res["last"][0])
             
