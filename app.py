@@ -32,7 +32,8 @@ if ticker_input:
     with st.spinner(f"Fetching option chains from MarketData for {ticker_input}..."):
         try:
             # --- PHASE 1: FETCH CURRENT UNDERLYING PRICE ---
-            price_url = f"https://api.marketdata.app/v1/markets/quotes/{ticker_input}/?token={MD_KEY}"
+            # NEW FIXED LINE
+            price_url = f"https://api.marketdata.app/v1/stocks/quotes/{ticker_input}/?token={MD_KEY}"
             price_res = requests.get(price_url).json()
             
             if "last" not in price_res or not price_res["last"]:
