@@ -1,22 +1,21 @@
 import streamlit as st
-import requests
 import pandas as pd
+import yfinance as yf
 from datetime import datetime, timedelta
 import google.generativeai as genai
 
 # 1. Page Configuration
-st.set_page_config(page_title="Market Data DITM LEAPS Portal", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Free yfinance LEAPS Portal", page_icon="📈", layout="wide")
 
-# 2. Secure API Configurations from Streamlit Secrets
-if "GEMINI_FREE_KEY" in st.secrets and "MARKETDATA_API_KEY" in st.secrets:
+# 2. Secure API Configurations
+if "GEMINI_FREE_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_FREE_KEY"])
-    MD_KEY = st.secrets["MARKETDATA_API_KEY"]
 else:
-    st.error("Missing API Keys (MARKETDATA_API_KEY or GEMINI_FREE_KEY) in Streamlit Secrets!")
+    st.error("Missing GEMINI_FREE_KEY in Streamlit Secrets!")
     st.stop()
 
 st.title("📈 Free Tier Deep In-The-Money (DITM) LEAPS Portal")
-st.subheader("Powered by MarketData App (Free Options API) & Gemini")
+st.subheader("Powered by yfinance (100% Free Engine) & Gemini")
 
 # Calculate 1 to 1.5 year target window automatically
 current_date = datetime.now()
@@ -29,93 +28,67 @@ st.info(f"📅 **Automated Window Tracking:** Target window between **{target_st
 ticker_input = st.text_input("Enter Stock Ticker Symbol:", placeholder="e.g., AAPL, NVDA, MSFT").strip().upper()
 
 if ticker_input:
-    with st.spinner(f"Fetching option chains from MarketData for {ticker_input}..."):
+    with st.spinner(f"Connecting to yfinance for {ticker_input}..."):
         try:
             # --- PHASE 1: FETCH CURRENT UNDERLYING PRICE ---
-            price_url = f"https://api.marketdata.app/v1/stocks/quotes/{ticker_input}/?token={MD_KEY}"
-            price_res = requests.get(price_url).json()
+            ticker_obj = yf.Ticker(ticker_input)
+            fast_info = ticker_obj.fast_info
             
-            # --- INSTANT DEBUG PROTECTION ---
-            if "status" in price_res and price_res["status"] == "ERROR":
-                st.error(f"🛑 **MarketData API Error:** {price_res.get('message', 'Unknown Error')}")
+            if not fast_info or 'lastPrice' not in fast_info:
+                st.error(f"Could not retrieve stock metrics for ticker: {ticker_input}. Verify symbol.")
                 st.stop()
                 
-            if "s" in price_res and price_res["s"] != "ok":
-                st.error(f"❌ **MarketData Server Notification:** {price_res.get('errmsg', 'No data available for this ticker.')}")
+            current_price = float(fast_info['lastPrice'])
+            
+            # --- PHASE 2: FETCH OPTIONS EXPIRATIONS ---
+            expirations = ticker_obj.options
+            if not expirations:
+                st.error(f"No options chain data available on yfinance for {ticker_input}.")
                 st.stop()
                 
-            if "last" not in price_res or not price_res["last"]:
-                st.error("⚠️ **Unexpected Response Grid Layout.** Raw server output displayed below:")
-                st.json(price_res)  # This forces your portal screen to show the exact error message
-                st.stop()
-            # ---------------------------------
+            # Filter expirations matching our strict 1-1.5 year window
+            valid_expirations = []
+            for exp_str in expirations:
+                exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
+                if target_start <= exp_date <= target_end:
+                    valid_expirations.append(exp_str)
+                    
+            # Fallback Security Rail: If window is empty, grab the furthest available date
+            if not valid_expirations:
+                valid_expirations = [expirations[-1]]
                 
-            current_price = float(price_res["last"][0])
+            selected_expiry = valid_expirations[0]
             
-            # --- PHASE 2: FETCH OPTIONS CHAIN ---
-            chain_url = f"https://api.marketdata.app/v1/options/chain/{ticker_input}/?expiration=all&side=call&token={MD_KEY}"
-            chain_res = requests.get(chain_url).json()
+            # --- PHASE 3: FETCH AND PARSE OPTIONS MATRIX ---
+            opt_chain = ticker_obj.option_chain(selected_expiry)
+            calls_df = opt_chain.calls
             
-            if "status" in chain_res and chain_res["status"] == "ERROR":
-                st.error(f"API Error: {chain_res.get('message', 'Failed to retrieve options data')}")
-                st.stop()
-                
-            if "underlying" not in chain_res and "updated" not in chain_res:
-                st.error(f"No option chain data returned for {ticker_input}. You may have exhausted your 100 daily credits.")
-                st.stop()
-                
-            # --- PHASE 3: PARSE AND FILTER FOR DITM LEAPS ---
-            # Rebuilding flat parallel arrays to prevent 'final_df not defined' error
-            raw_df = pd.DataFrame({
-                "Side": chain_res.get("side", []),
-                "Expiration": chain_res.get("expiration", []),
-                "Strike": [float(s) for s in chain_res.get("strike", [])],
-                "Bid": [float(b) for b in chain_res.get("bid", [])],
-                "Ask": [float(a) for a in chain_res.get("ask", [])],
-                "OI": [int(o) for o in chain_res.get("openInterest", [])]
-            })
-            
-            # Step 1: Force filter out everything except Calls
-            raw_df = raw_df[raw_df["Side"] == "call"].copy()
-            
-            # Step 2: Safely parse text timestamps to dates
-            raw_df["Exp_Date"] = pd.to_datetime(raw_df["Expiration"], errors="coerce")
-            
-            # Step 3: Run the 1 to 1.5 year target date filtering window
-            leaps_df = raw_df[(raw_df["Exp_Date"] >= pd.to_datetime(target_start)) & 
-                               (raw_df["Exp_Date"] <= pd.to_datetime(target_end))].copy()
-            
-            # Fallback Rail: If the free tier cuts far forward options short, grab furthest available
-            if leaps_df.empty and not raw_df.empty:
-                max_date = raw_df["Exp_Date"].max()
-                leaps_df = raw_df[raw_df["Exp_Date"] == max_date].copy()
-            
-            if leaps_df.empty:
-                st.error("No valid options contracts whatsoever were found for this asset.")
+            if calls_df.empty:
+                st.error(f"No Call option contracts found for expiration date: {selected_expiry}")
                 st.stop()
                 
-            # Isolate the targeted expiration date layer
-            target_expiry = leaps_df["Expiration"].min()
-            final_df = leaps_df[leaps_df["Expiration"] == target_expiry].copy()
-            
-            # Step 4: Filter for Deep In-The-Money (Strikes less than current stock price)
-            final_df = final_df[final_df["Strike"] < current_price].copy()
+            # Filter for Deep In-The-Money (Strikes less than current stock price)
+            final_df = calls_df[calls_df["strike"] < current_price].copy()
             
             if final_df.empty:
-                st.error("No Deep In-The-Money options matched your filtration thresholds (Strikes are all above current price).")
+                st.error("No Deep In-The-Money options matched your filtration thresholds.")
                 st.stop()
                 
             # --- PHASE 4: STRUCTURAL METRICS & MATH ---
-            final_df["Mid Premium"] = (final_df["Bid"] + final_df["Ask"]) / 2
-            final_df["Intrinsic"] = current_price - final_df["Strike"]
+            # Fill empty bid/ask gaps with the last trade price if volume is thin
+            final_df["bid"] = final_df["bid"].fillna(final_df["lastPrice"])
+            final_df["ask"] = final_df["ask"].fillna(final_df["lastPrice"])
+            
+            final_df["Mid Premium"] = (final_df["bid"] + final_df["ask"]) / 2
+            final_df["Intrinsic"] = current_price - final_df["strike"]
             final_df["Extrinsic"] = (final_df["Mid Premium"] - final_df["Intrinsic"]).clip(lower=0)
             final_df["Extrinsic Drag %"] = ((final_df["Extrinsic"] / current_price) * 100).round(2)
-            final_df["Break Even"] = final_df["Strike"] + final_df["Mid Premium"]
+            final_df["Break Even"] = final_df["strike"] + final_df["Mid Premium"]
             final_df["B/E % Move"] = (((final_df["Break Even"] - current_price) / current_price) * 100).round(2)
             
             # Keep and format output presentation columns
-            output_df = final_df[["Strike", "Mid Premium", "OI", "Extrinsic Drag %", "B/E % Move"]].copy()
-            output_df = output_df.rename(columns={"OI": "Open Interest (OI)"})
+            output_df = final_df[["strike", "Mid Premium", "openInterest", "Extrinsic Drag %", "B/E % Move"]].copy()
+            output_df = output_df.rename(columns={"strike": "Strike", "openInterest": "Open Interest (OI)"})
             
             # Sort strikes from deep cushion to higher bounds, trim snapshot matrix for display
             output_df = output_df.sort_values(by="Strike", ascending=False).tail(8)
@@ -123,16 +96,16 @@ if ticker_input:
             
             # --- PHASE 5: DISPLAY & AI ASSESSMENT ---
             st.success(f"### Live Market Sync: {ticker_input} is trading at ${current_price:.2f}")
-            st.info(f"📦 Selected Expiration: **{target_expiry}**")
+            st.info(f"📦 Selected Expiration: **{selected_expiry}**")
             
-            st.markdown("#### 📊 Official Options Chain Metrics (MarketData Feed)")
+            st.markdown("#### 📊 Official Options Chain Metrics (yfinance Feed)")
             st.dataframe(output_df, use_container_width=True, hide_index=True)
             
             with st.spinner("Invoking free AI layer to verify risk-reward anomalies..."):
                 ai_prompt = f"""
                 You are an options trading specialist. Analyze this DITM LEAPS Call data for {ticker_input}.
                 Current Stock Price: ${current_price:.2f}
-                Expiration Date: {target_expiry}
+                Expiration Date: {selected_expiry}
                 
                 Data Matrix:
                 {data_payload}
